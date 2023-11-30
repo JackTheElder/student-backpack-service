@@ -1,0 +1,111 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+
+parameters:
+  - name: Location
+    type: string
+    default: westus2
+    values:
+    - westus2
+
+stages:
+- stage: build
+  jobs:
+    - job: build
+      steps:
+      - task: NuGetAuthenticate@1
+        displayName: 'Authenticate to NuGet'
+
+      - task: Docker@2
+        displayName: Build docker image
+        inputs:
+          containerRegistry: 'svc_acr_students_dev'
+          repository: 'student-backpack'
+          command: 'build'
+          Dockerfile: '$(system.defaultworkingdirectory)/Dockerfile'
+          tags: '$(Build.BuildNumber)'
+          arguments: '--build-arg FEED_ACCESS_TOKEN=$(VSS_NUGET_ACCESSTOKEN)'
+
+      - task: Docker@2
+        displayName: Push docker image to repository
+        inputs:
+          containerRegistry: 'svc_acr_students_dev'
+          repository: 'student-backpack'
+          command: 'push'
+          tags: '$(Build.BuildNumber)'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet restore'
+        inputs:
+          command: 'restore'
+          feedsToUse: 'config'
+          nugetConfigPath: 'NuGet.config'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet build'
+        inputs:
+           command: 'build'
+           arguments: '-c $(buildConfiguration) --no-restore'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet test'
+        inputs:
+          command: 'test'
+          arguments: '-c $(buildConfiguration) --no-build --collect:"Code Coverage"'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet publish'
+        inputs:
+          command: 'publish'
+          publishWebProjects: false
+          arguments: '-c $(buildConfiguration) --no-build -o $(Build.ArtifactStagingDirectory)'
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: '$(Build.DefinitionName)'
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Infrastructure files'
+        inputs:
+          PathtoPublish: './.deploy'
+          ArtifactName: '.deploy'
+
+
+- stage: DeploytoDev
+  #condition: and(succeeded(), eq(variables['build.sourceBranch'], 'refs/heads/main'))
+  jobs:
+    - deployment: DeploytoDev
+      environment: 'student-backpack@dev'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzureResourceManagerTemplateDeployment@3
+              inputs:
+                 deploymentScope: 'Resource Group'
+                 azureResourceManagerConnection: 'svc_dev_test_wizards'
+                 subscriptionId: 'a0cc886c-cf4f-4663-9d57-0da18548853b'
+                 action: 'Create Or Update Resource Group'
+                 resourceGroupName: "rg-dev-students" #$(resourceGroup)
+                 location: ${{ parameters.Location }}
+                 csmFile: $(Pipeline.Workspace)/.deploy/main.bicep
+                 csmParametersFile: $(Pipeline.Workspace)/.deploy/.parameters/dev.parameters.json
+                 deploymentMode: Incremental
+
+            - task: AzureContainerApps@1
+              inputs:
+                azureSubscription: 'svc_dev_test_wizards'
+                imageToDeploy: 'acrusimsdev.azurecr.io/student-backpack:$(Build.BuildNumber)'
+                containerAppName: 'ca-students-dev'
+                resourceGroup: 'rg-dev-students'
+                containerAppEnvironment: 'students-dev'
+                targetPort: '80'
+                location: 'westus2'
